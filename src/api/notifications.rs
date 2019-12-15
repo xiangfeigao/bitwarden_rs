@@ -396,12 +396,12 @@ pub fn start_notification_server() -> WebSocketUsers {
             settings.queue_size = 2;
             settings.panic_on_internal = false;
 
-            ws::Builder::new()
-                .with_settings(settings)
-                .build(factory)
-                .unwrap()
-                .listen((CONFIG.websocket_address().as_str(), CONFIG.websocket_port()))
+            let ws = ws::Builder::new().with_settings(settings).build(factory).unwrap();
+            CONFIG.set_ws_shutdown_handle(ws.broadcaster());
+            ws.listen((CONFIG.websocket_address().as_str(), CONFIG.websocket_port()))
                 .unwrap();
+
+            warn!("WS Server stopped!");
         });
     }
 

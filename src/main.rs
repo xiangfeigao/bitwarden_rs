@@ -273,6 +273,6 @@ fn launch_rocket(extra_debug: bool) {
         .attach(util::CORS())
         .attach(util::BetterLogging(extra_debug));
 
-    CONFIG.set_shutdown_handle(rocket.get_shutdown_handle());
+    CONFIG.set_rocket_shutdown_handle(rocket.get_shutdown_handle());
     let _ = rocket.launch();
 }
