@@ -273,7 +273,6 @@ fn launch_rocket(extra_debug: bool) {
         .attach(util::CORS())
         .attach(util::BetterLogging(extra_debug));
 
-    // Launch and print error if there is one
-    // The launch will restore the original logging level
-    error!("Launch error {:#?}", rocket.launch());
+    CONFIG.set_shutdown_handle(rocket.get_shutdown_handle());
+    let _ = rocket.launch();
 }

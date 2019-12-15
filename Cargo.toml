@@ -27,6 +27,7 @@ rocket_contrib = "0.5.0-dev"
 
 # Async futures
 futures = "0.3.1"
+tokio = { version = "0.2.6", features = ["blocking", "fs"] }
 
 # HTTP client
 reqwest = "0.9.24"

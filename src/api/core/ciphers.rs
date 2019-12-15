@@ -632,13 +632,13 @@ fn share_cipher_by_uuid(
 }
 
 #[post("/ciphers/<uuid>/attachment", format = "multipart/form-data", data = "<data>")]
-fn post_attachment(
+async fn post_attachment(
     uuid: String,
     data: Data,
     content_type: &ContentType,
     headers: Headers,
     conn: DbConn,
-    nt: Notify,
+    nt: Notify<'_>,
 ) -> JsonResult {
     let cipher = match Cipher::find_by_uuid(&uuid, &conn) {
         Some(cipher) => cipher,
@@ -648,76 +648,96 @@ fn post_attachment(
     if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn) {
         err!("Cipher is not write accessible")
     }
-
-    // TODO: Multipart upload not supported in async
-    err!("Multipart upload not supported in async")
-    /*
+    // Extract the multipart boundary
     let mut params = content_type.params();
     let boundary_pair = params.next().expect("No boundary provided");
-    let boundary = boundary_pair.1;
+    let boundary = boundary_pair.1.to_string();
 
+    // Create the folder if it doesn't exist already
     let base_path = Path::new(&CONFIG.attachments_folder()).join(&cipher.uuid);
+    tokio::fs::create_dir_all(base_path.clone()).await?;
 
-    let mut attachment_key = None;
+    // Create the temp file where we are gonna save the multipart data
+    // TODO: We need to do this to provide multipart with the Read interface it expects,
+    // once it supports async we can remove this
+    let temp_file = base_path.join(format!("{}.tmp", HEXLOWER.encode(&crypto::get_random(vec![0; 3]))));
+    data.stream_to_file(temp_file.clone()).await?;
 
-    Multipart::with_body(data.open(), boundary)
-        .foreach_entry(|mut field| {
-            match &*field.headers.name {
-                "key" => {
-                    use std::io::Read;
-                    let mut key_buffer = String::new();
-                    if field.data.read_to_string(&mut key_buffer).is_ok() {
-                        attachment_key = Some(key_buffer);
+    // Process the multipart data
+    // TODO: Blocking code until multipart supports async
+    let temp_file_cloned = temp_file.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let f = std::fs::File::open(temp_file_cloned).unwrap();
+        let mut attachment_key: Option<String> = None;
+
+        Multipart::with_body(f, boundary)
+            .foreach_entry(|mut field| {
+                match &*field.headers.name {
+                    "key" => {
+                        use std::io::Read;
+                        let mut key_buffer = String::new();
+                        if field.data.read_to_string(&mut key_buffer).is_ok() {
+                            attachment_key = Some(key_buffer);
+                        }
                     }
+                    "data" => {
+                        // This is provided by the client, don't trust it
+                        let name = field.headers.filename.expect("No filename provided");
+
+                        let file_name = HEXLOWER.encode(&crypto::get_random(vec![0; 10]));
+                        let path = base_path.join(&file_name);
+
+                        let size = match field.data.save().memory_threshold(0).size_limit(None).with_path(path) {
+                            SaveResult::Full(SavedData::File(_, size)) => size as i32,
+                            SaveResult::Full(other) => {
+                                error!("Attachment is not a file: {:?}", other);
+                                return;
+                            }
+                            SaveResult::Partial(_, reason) => {
+                                error!("Partial result: {:?}", reason);
+                                return;
+                            }
+                            SaveResult::Error(e) => {
+                                error!("Error: {:?}", e);
+                                return;
+                            }
+                        };
+
+                        let mut attachment = Attachment::new(file_name, cipher.uuid.clone(), name, size);
+                        attachment.akey = attachment_key.clone();
+                        attachment.save(&conn).expect("Error saving attachment");
+                    }
+                    _ => error!("Invalid multipart name"),
                 }
-                "data" => {
-                    // This is provided by the client, don't trust it
-                    let name = field.headers.filename.expect("No filename provided");
+            })
+            .expect("Error processing multipart data");
 
-                    let file_name = HEXLOWER.encode(&crypto::get_random(vec![0; 10]));
-                    let path = base_path.join(&file_name);
+        (cipher, conn) // Return them to avoid move errors
+    })
+    .await;
 
-                    let size = match field.data.save().memory_threshold(0).size_limit(None).with_path(path) {
-                        SaveResult::Full(SavedData::File(_, size)) => size as i32,
-                        SaveResult::Full(other) => {
-                            error!("Attachment is not a file: {:?}", other);
-                            return;
-                        }
-                        SaveResult::Partial(_, reason) => {
-                            error!("Partial result: {:?}", reason);
-                            return;
-                        }
-                        SaveResult::Error(e) => {
-                            error!("Error: {:?}", e);
-                            return;
-                        }
-                    };
+    // Delete temp file
+    tokio::fs::remove_file(temp_file).await?;
 
-                    let mut attachment = Attachment::new(file_name, cipher.uuid.clone(), name, size);
-                    attachment.akey = attachment_key.clone();
-                    attachment.save(&conn).expect("Error saving attachment");
-                }
-                _ => error!("Invalid multipart name"),
-            }
-        })
-        .expect("Error processing multipart data");
-
-    nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(&conn));
-
-    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, &conn)))
-    */
+    match res {
+        Ok((cipher, conn)) => {
+            nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(&conn));
+            Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, &conn)))
+        }
+        Err(_) => err!("Error saving multipart data"),
+    }
 }
 
 #[post("/ciphers/<uuid>/attachment-admin", format = "multipart/form-data", data = "<data>")]
-fn post_attachment_admin(
+async fn post_attachment_admin(
     uuid: String,
     data: Data,
     content_type: &ContentType,
     headers: Headers,
     conn: DbConn,
-    nt: Notify,
+    nt: Notify<'_>,
 ) -> JsonResult {
-    post_attachment(uuid, data, content_type, headers, conn, nt)
+    post_attachment(uuid, data, content_type, headers, conn, nt).await
 }
 
 #[post(
@@ -725,17 +745,17 @@ fn post_attachment_admin(
     format = "multipart/form-data",
     data = "<data>"
 )]
-fn post_attachment_share(
+async fn post_attachment_share(
     uuid: String,
     attachment_id: String,
     data: Data,
     content_type: &ContentType,
     headers: Headers,
     conn: DbConn,
-    nt: Notify,
+    nt: Notify<'_>,
 ) -> JsonResult {
     _delete_cipher_attachment_by_id(&uuid, &attachment_id, &headers, &conn, &nt)?;
-    post_attachment(uuid, data, content_type, headers, conn, nt)
+    post_attachment(uuid, data, content_type, headers, conn, nt).await
 }
 
 #[post("/ciphers/<uuid>/attachment/<attachment_id>/delete-admin")]

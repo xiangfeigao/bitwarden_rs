@@ -29,6 +29,7 @@ macro_rules! make_config {
         pub struct Config { inner: RwLock<Inner> }
 
         struct Inner {
+            shutdown_handle: Option<rocket::shutdown::ShutdownHandle>,
             templates: Handlebars,
             config: ConfigItems,
 
@@ -456,7 +457,13 @@ impl Config {
         validate_config(&config)?;
 
         Ok(Config {
-            inner: RwLock::new(Inner { templates: load_templates(&config.templates_folder), config, _env, _usr }),
+            inner: RwLock::new(Inner {
+                templates: load_templates(&config.templates_folder),
+                shutdown_handle: None,
+                config,
+                _env,
+                _usr,
+            }),
         })
     }
 
@@ -575,6 +582,14 @@ impl Config {
             hb.render(name, data).map_err(Into::into)
         }
     }
+
+    pub fn set_shutdown_handle(&self, handle: rocket::shutdown::ShutdownHandle) {
+        self.inner.write().unwrap().shutdown_handle = Some(handle);
+    }
+
+    pub fn shutdown(&self) {
+        self.inner.read().unwrap().shutdown_handle.clone().map(|s| s.shutdown());
+    }
 }
 
 use handlebars::{
@@ -637,7 +652,9 @@ impl HelperDef for CaseHelper {
         rc: &mut RenderContext<'reg>,
         out: &mut dyn Output,
     ) -> HelperResult {
-        let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"case\""))?;
+        let param = h
+            .param(0)
+            .ok_or_else(|| RenderError::new("Param not found for helper \"case\""))?;
         let value = param.value().clone();
 
         if h.params().iter().skip(1).any(|x| x.value() == &value) {
@@ -659,10 +676,14 @@ impl HelperDef for JsEscapeHelper {
         _: &mut RenderContext<'reg>,
         out: &mut dyn Output,
     ) -> HelperResult {
-        let param = h.param(0).ok_or_else(|| RenderError::new("Param not found for helper \"js_escape\""))?;
+        let param = h
+            .param(0)
+            .ok_or_else(|| RenderError::new("Param not found for helper \"js_escape\""))?;
 
-        let value =
-            param.value().as_str().ok_or_else(|| RenderError::new("Param for helper \"js_escape\" is not a String"))?;
+        let value = param
+            .value()
+            .as_str()
+            .ok_or_else(|| RenderError::new("Param for helper \"js_escape\" is not a String"))?;
 
         let escaped_value = value.replace('\\', "").replace('\'', "\\x22").replace('\"', "\\x27");
         let quoted_value = format!("&quot;{}&quot;", escaped_value);
