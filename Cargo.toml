@@ -119,8 +119,8 @@ percent-encoding = "2.1.0"
 
 [patch.crates-io]
 # Use newest ring
-rocket = { git = 'https://github.com/SergioBenitez/Rocket', rev = 'd8a9ca5d856bdf22535f0886e24246b85966db1d' }
-rocket_contrib = { git = 'https://github.com/SergioBenitez/Rocket', rev = 'd8a9ca5d856bdf22535f0886e24246b85966db1d' }
+rocket = { git = 'https://github.com/SergioBenitez/Rocket', rev = '6e6fb2866ec8192f7deaf82fb807df9d484ee2bf' }
+rocket_contrib = { git = 'https://github.com/SergioBenitez/Rocket', rev = '6e6fb2866ec8192f7deaf82fb807df9d484ee2bf' }
 
 # Use git version for timeout fix #706
 lettre = { git = 'https://github.com/lettre/lettre', rev = '24d694db3be017d82b1cdc8bf9da601420b31bb0' }
