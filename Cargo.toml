@@ -27,10 +27,11 @@ rocket_contrib = "0.5.0-dev"
 
 # Async futures
 futures = "0.3.1"
-tokio = { version = "0.2.6", features = ["blocking", "fs"] }
+tokio = { version = "0.2.6", features = ["blocking", "fs", "io-util"] }
 
 # HTTP client
-reqwest = "0.9.24"
+reqwest = { version = "0.10.0", features = ["gzip", "json", "stream"] }
+bytes = "0.5.3"
 
 # multipart/form-data support
 multipart = { version = "0.16.1", features = ["server"], default-features = false }
