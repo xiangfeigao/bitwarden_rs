@@ -274,5 +274,13 @@ fn launch_rocket(extra_debug: bool) {
         .attach(util::BetterLogging(extra_debug));
 
     CONFIG.set_rocket_shutdown_handle(rocket.get_shutdown_handle());
+    ctrlc::set_handler(move || {
+        info!("Exiting bitwarden_rs!");
+        CONFIG.shutdown();
+    })
+    .expect("Error setting Ctrl-C handler");
+    
     let _ = rocket.launch();
+    
+    info!("Bitwarden_rs process exited!");
 }
