@@ -38,7 +38,7 @@ fn login(data: Form<ConnectData>, conn: DbConn, ip: ClientIp) -> JsonResult {
             _check_is_some(&data.device_name, "device_name cannot be blank")?;
             _check_is_some(&data.device_type, "device_type cannot be blank")?;
 
-            _password_login(data, conn, ip)
+            _password_login(data, conn, &ip)
         }
         t => err!("Invalid type", t),
     }
@@ -71,7 +71,7 @@ fn _refresh_login(data: ConnectData, conn: DbConn) -> JsonResult {
     })))
 }
 
-fn _password_login(data: ConnectData, conn: DbConn, ip: ClientIp) -> JsonResult {
+fn _password_login(data: ConnectData, conn: DbConn, ip: &ClientIp) -> JsonResult {
     // Validate scope
     let scope = data.scope.as_ref().unwrap();
     if scope != "api offline_access" {
@@ -127,7 +127,7 @@ fn _password_login(data: ConnectData, conn: DbConn, ip: ClientIp) -> JsonResult 
 
     let (mut device, new_device) = get_device(&data, &conn, &user);
 
-    let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, &conn)?;
+    let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, &ip, &conn)?;
 
     if CONFIG.mail_enabled() && new_device {
         if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &device.updated_at, &device.name) {
@@ -197,6 +197,7 @@ fn twofactor_auth(
     user_uuid: &str,
     data: &ConnectData,
     device: &mut Device,
+    ip: &ClientIp,
     conn: &DbConn,
 ) -> ApiResult<Option<String>> {
     let twofactors = TwoFactor::find_by_user(user_uuid, conn);
@@ -216,8 +217,7 @@ fn twofactor_auth(
 
     let selected_twofactor = twofactors
         .into_iter()
-        .filter(|tf| tf.atype == selected_id && tf.enabled)
-        .nth(0);
+        .find(|tf| tf.atype == selected_id && tf.enabled);
 
     use crate::api::core::two_factor as _tf;
     use crate::crypto::ct_eq;
@@ -226,7 +226,7 @@ fn twofactor_auth(
     let mut remember = data.two_factor_remember.unwrap_or(0);
 
     match TwoFactorType::from_i32(selected_id) {
-        Some(TwoFactorType::Authenticator) => _tf::authenticator::validate_totp_code_str(user_uuid, twofactor_code, &selected_data?, conn)?,
+        Some(TwoFactorType::Authenticator) => _tf::authenticator::validate_totp_code_str(user_uuid, twofactor_code, &selected_data?, ip, conn)?,
         Some(TwoFactorType::U2f) => _tf::u2f::validate_u2f_login(user_uuid, twofactor_code, conn)?,
         Some(TwoFactorType::YubiKey) => _tf::yubikey::validate_yubikey_login(twofactor_code, &selected_data?)?,
         Some(TwoFactorType::Duo) => _tf::duo::validate_duo_login(data.username.as_ref().unwrap(), twofactor_code, conn)?,
@@ -347,6 +347,7 @@ fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &DbConn) -> Api
     Ok(result)
 }
 
+// https://github.com/bitwarden/mobile/blob/master/src/Core/Models/Request/TokenRequest.cs
 #[derive(Debug, Clone, Default)]
 #[allow(non_snake_case)]
 struct ConnectData {
@@ -364,6 +365,7 @@ struct ConnectData {
     device_identifier: Option<String>,
     device_name: Option<String>,
     device_type: Option<String>,
+    device_push_token: Option<String>, // Unused; mobile device push not yet supported.
 
     // Needed for two-factor auth
     two_factor_provider: Option<i32>,
@@ -391,6 +393,7 @@ impl<'f> FromForm<'f> for ConnectData {
                 "deviceidentifier" => form.device_identifier = Some(value),
                 "devicename" => form.device_name = Some(value),
                 "devicetype" => form.device_type = Some(value),
+                "devicepushtoken" => form.device_push_token = Some(value),
                 "twofactorprovider" => form.two_factor_provider = value.parse().ok(),
                 "twofactortoken" => form.two_factor_token = Some(value),
                 "twofactorremember" => form.two_factor_remember = value.parse().ok(),

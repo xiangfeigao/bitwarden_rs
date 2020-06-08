@@ -5,6 +5,7 @@ use crate::CONFIG;
 
 #[derive(Debug, Identifiable, Queryable, Insertable, Associations, AsChangeset)]
 #[table_name = "devices"]
+#[changeset_options(treat_none_as_null="true")]
 #[belongs_to(User, foreign_key = "user_uuid")]
 #[primary_key(uuid)]
 pub struct Device {
@@ -76,7 +77,6 @@ impl Device {
         let orguser: Vec<_> = orgs.iter().filter(|o| o.atype == 2).map(|o| o.org_uuid.clone()).collect();
         let orgmanager: Vec<_> = orgs.iter().filter(|o| o.atype == 3).map(|o| o.org_uuid.clone()).collect();
 
-
         // Create the JWT claims struct, to send to the client
         use crate::auth::{encode_jwt, LoginJWTClaims, DEFAULT_VALIDITY, JWT_LOGIN_ISSUER};
         let claims = LoginJWTClaims {
@@ -107,7 +107,6 @@ impl Device {
 
 use crate::db::schema::devices;
 use crate::db::DbConn;
-use diesel;
 use diesel::prelude::*;
 
 use crate::api::EmptyResult;

@@ -1,6 +1,6 @@
+use once_cell::sync::Lazy;
 use rocket::Route;
 use rocket_contrib::json::Json;
-use serde_json;
 use serde_json::Value;
 use u2f::messages::{RegisterResponse, SignResponse, U2fSignRequest};
 use u2f::protocol::{Challenge, U2f};
@@ -18,10 +18,8 @@ use crate::CONFIG;
 
 const U2F_VERSION: &str = "U2F_V2";
 
-lazy_static! {
-    static ref APP_ID: String = format!("{}/app-id.json", &CONFIG.domain());
-    static ref U2F: U2f = U2f::new(APP_ID.clone());
-}
+static APP_ID: Lazy<String> = Lazy::new(|| format!("{}/app-id.json", &CONFIG.domain()));
+static U2F: Lazy<U2f> = Lazy::new(|| U2f::new(APP_ID.clone()));
 
 pub fn routes() -> Vec<Route> {
     routes![
@@ -92,6 +90,7 @@ struct RegistrationDef {
     key_handle: Vec<u8>,
     pub_key: Vec<u8>,
     attestation_cert: Option<Vec<u8>>,
+    device_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

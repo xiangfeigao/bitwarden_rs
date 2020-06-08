@@ -2,6 +2,7 @@ use rocket::request::Form;
 use rocket::Route;
 use rocket_contrib::json::Json;
 use serde_json::Value;
+use num_traits::FromPrimitive;
 
 use crate::api::{
     EmptyResult, JsonResult, JsonUpcase, JsonUpcaseVec, Notify, NumberOrString, PasswordData, UpdateType,
@@ -45,6 +46,10 @@ pub fn routes() -> Vec<Route> {
         delete_user,
         post_delete_user,
         post_org_import,
+        list_policies,
+        list_policies_token,
+        get_policy,
+        put_policy,
     ]
 }
 
@@ -369,7 +374,7 @@ fn get_collection_users(org_id: String, coll_id: String, _headers: AdminHeaders,
         .map(|col_user| {
             UserOrganization::find_by_user_and_org(&col_user.user_uuid, &org_id, &conn)
                 .unwrap()
-                .to_json_collection_user_details(col_user.read_only)
+                .to_json_read_only(col_user.read_only)
         })
         .collect();
 
@@ -480,7 +485,11 @@ fn send_invite(org_id: String, data: JsonUpcase<InviteData>, headers: AdminHeade
         let user = match User::find_by_mail(&email, &conn) {
             None => {
                 if !CONFIG.invitations_allowed() {
-                    err!(format!("User email does not exist: {}", email))
+                    err!(format!("User does not exist: {}", email))
+                }
+
+                if !CONFIG.is_email_domain_allowed(&email) {
+                    err!("Email domain not eligible for invitations")
                 }
 
                 if !CONFIG.mail_enabled() {
@@ -830,21 +839,12 @@ struct RelationsData {
 fn post_org_import(
     query: Form<OrgIdData>,
     data: JsonUpcase<ImportData>,
-    headers: Headers,
+    headers: AdminHeaders,
     conn: DbConn,
     nt: Notify,
 ) -> EmptyResult {
     let data: ImportData = data.into_inner().data;
     let org_id = query.into_inner().organization_id;
-
-    let org_user = match UserOrganization::find_by_user_and_org(&headers.user.uuid, &org_id, &conn) {
-        Some(user) => user,
-        None => err!("User is not part of the organization"),
-    };
-
-    if org_user.atype < UserOrgType::Admin {
-        err!("Only admins or owners can import into an organization")
-    }
 
     // Read and create the collections
     let collections: Vec<_> = data
@@ -865,6 +865,8 @@ fn post_org_import(
     for relation in data.CollectionRelationships {
         relations.push((relation.Key, relation.Value));
     }
+
+    let headers: Headers = headers.into();
 
     // Read and create the ciphers
     let ciphers: Vec<_> = data
@@ -900,4 +902,84 @@ fn post_org_import(
 
     let mut user = headers.user;
     user.update_revision(&conn)
+}
+
+#[get("/organizations/<org_id>/policies")]
+fn list_policies(org_id: String, _headers: AdminHeaders, conn: DbConn) -> JsonResult {
+    let policies = OrgPolicy::find_by_org(&org_id, &conn);
+    let policies_json: Vec<Value> = policies.iter().map(OrgPolicy::to_json).collect();
+
+    Ok(Json(json!({
+        "Data": policies_json,
+        "Object": "list",
+        "ContinuationToken": null
+    })))
+}
+
+#[get("/organizations/<org_id>/policies/token?<token>")]
+fn list_policies_token(org_id: String, token: String, conn: DbConn) -> JsonResult {
+    let invite = crate::auth::decode_invite(&token)?;
+
+    let invite_org_id = match invite.org_id {
+        Some(invite_org_id) => invite_org_id,
+        None => err!("Invalid token"),
+    };
+
+    if invite_org_id != org_id {
+        err!("Token doesn't match request organization");
+    }
+    
+    // TODO: We receive the invite token as ?token=<>, validate it contains the org id
+    let policies = OrgPolicy::find_by_org(&org_id, &conn);
+    let policies_json: Vec<Value> = policies.iter().map(OrgPolicy::to_json).collect();
+
+    Ok(Json(json!({
+        "Data": policies_json,
+        "Object": "list",
+        "ContinuationToken": null
+    })))
+}
+
+#[get("/organizations/<org_id>/policies/<pol_type>")]
+fn get_policy(org_id: String, pol_type: i32, _headers: AdminHeaders, conn: DbConn) -> JsonResult {
+    let pol_type_enum = match OrgPolicyType::from_i32(pol_type) {
+        Some(pt) => pt,
+        None => err!("Invalid policy type"),
+    };
+
+    let policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type, &conn) {
+        Some(p) => p,
+        None => OrgPolicy::new(org_id, pol_type_enum, "{}".to_string()),
+    };
+
+    Ok(Json(policy.to_json()))
+}
+
+#[derive(Deserialize)]
+struct PolicyData {
+    enabled: bool,
+    #[serde(rename = "type")]
+    _type: i32,
+    data: Value,
+}
+
+#[put("/organizations/<org_id>/policies/<pol_type>", data = "<data>")]
+fn put_policy(org_id: String, pol_type: i32, data: Json<PolicyData>, _headers: AdminHeaders, conn: DbConn) -> JsonResult {
+    let data: PolicyData = data.into_inner();
+
+    let pol_type_enum = match OrgPolicyType::from_i32(pol_type) {
+        Some(pt) => pt,
+        None => err!("Invalid policy type"),
+    };
+
+    let mut policy = match OrgPolicy::find_by_org_and_type(&org_id, pol_type, &conn) {
+        Some(p) => p,
+        None => OrgPolicy::new(org_id, pol_type_enum, "{}".to_string()),
+    };
+
+    policy.enabled = data.enabled;
+    policy.data = serde_json::to_string(&data.data)?;
+    policy.save(&conn)?;
+
+    Ok(Json(policy.to_json()))
 }

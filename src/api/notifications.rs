@@ -152,15 +152,19 @@ impl WSHandler {
 impl Handler for WSHandler {
     fn on_open(&mut self, hs: Handshake) -> ws::Result<()> {
         // Path == "/notifications/hub?id=<id>==&access_token=<access_token>"
+        //
+        // We don't use `id`, and as of around 2020-03-25, the official clients
+        // no longer seem to pass `id` (only `access_token`).
         let path = hs.request.resource();
 
         let (_id, access_token) = match path.split('?').nth(1) {
             Some(params) => {
-                let mut params_iter = params.split('&').take(2);
+                let params_iter = params.split('&').take(2);
 
                 let mut id = None;
                 let mut access_token = None;
-                while let Some(val) = params_iter.next() {
+                
+                for val in params_iter {
                     if val.starts_with(ID_KEY) {
                         id = Some(&val[ID_KEY.len()..]);
                     } else if val.starts_with(ACCESS_TOKEN_KEY) {
@@ -170,10 +174,11 @@ impl Handler for WSHandler {
 
                 match (id, access_token) {
                     (Some(a), Some(b)) => (a, b),
-                    _ => return self.err("Missing id or access token"),
+                    (None, Some(b)) => ("", b), // Ignore missing `id`.
+                    _ => return self.err("Missing access token"),
                 }
             }
-            None => return self.err("Missing query path"),
+            None => return self.err("Missing query parameters"),
         };
 
         // Validate the user
@@ -256,7 +261,9 @@ impl Factory for WSFactory {
         // Remove handler
         if let Some(user_uuid) = &handler.user_uuid {
             if let Some(mut user_conn) = self.users.map.get_mut(user_uuid) {
-                user_conn.remove_item(&handler.out);
+                if let Some(pos) = user_conn.iter().position(|x| x == &handler.out) {
+                    user_conn.remove(pos);
+                }
             }
         }
     }

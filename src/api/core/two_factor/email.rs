@@ -1,6 +1,5 @@
 use rocket::Route;
 use rocket_contrib::json::Json;
-use serde_json;
 
 use crate::api::core::two_factor::_generate_recover_code;
 use crate::api::{EmptyResult, JsonResult, JsonUpcase, PasswordData};
@@ -271,10 +270,10 @@ impl EmailTokenData {
 
 /// Takes an email address and obscures it by replacing it with asterisks except two characters.
 pub fn obscure_email(email: &str) -> String {
-    let split: Vec<&str> = email.split('@').collect();
+    let split: Vec<&str> = email.rsplitn(2, '@').collect();
 
-    let mut name = split[0].to_string();
-    let domain = &split[1];
+    let mut name = split[1].to_string();
+    let domain = &split[0];
 
     let name_size = name.chars().count();
 

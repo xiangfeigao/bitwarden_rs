@@ -1,11 +1,11 @@
-use lettre::smtp::authentication::Credentials;
-use lettre::smtp::authentication::Mechanism as SmtpAuthMechanism;
-use lettre::smtp::ConnectionReuseParameters;
-use lettre::{ClientSecurity, ClientTlsParameters, SmtpClient, SmtpTransport, Transport};
-use lettre_email::{EmailBuilder, MimeMultipartType, PartBuilder};
+use std::str::FromStr;
+
+use lettre::message::{header, Mailbox, Message, MultiPart, SinglePart};
+use lettre::transport::smtp::authentication::{Credentials, Mechanism as SmtpAuthMechanism};
+use lettre::{Address, SmtpTransport, Tls, TlsParameters, Transport};
+
 use native_tls::{Protocol, TlsConnector};
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
-use quoted_printable::encode_to_str;
 
 use crate::api::EmptyResult;
 use crate::auth::{encode_jwt, generate_delete_claims, generate_invite_claims, generate_verify_email_claims};
@@ -22,42 +22,40 @@ fn mailer() -> SmtpTransport {
             .build()
             .unwrap();
 
-        let params = ClientTlsParameters::new(host.clone(), tls);
+        let params = TlsParameters::new(host.clone(), tls);
 
         if CONFIG.smtp_explicit_tls() {
-            ClientSecurity::Wrapper(params)
+            Tls::Wrapper(params)
         } else {
-            ClientSecurity::Required(params)
+            Tls::Required(params)
         }
     } else {
-        ClientSecurity::None
+        Tls::None
     };
 
     use std::time::Duration;
 
-    let smtp_client = SmtpClient::new((host.as_str(), CONFIG.smtp_port()), client_security).unwrap();
+    let smtp_client = SmtpTransport::builder(host).port(CONFIG.smtp_port()).tls(client_security);
 
-    let smtp_client = match (&CONFIG.smtp_username(), &CONFIG.smtp_password()) {
-        (Some(user), Some(pass)) => smtp_client.credentials(Credentials::new(user.clone(), pass.clone())),
+    let smtp_client = match (CONFIG.smtp_username(), CONFIG.smtp_password()) {
+        (Some(user), Some(pass)) => smtp_client.credentials(Credentials::new(user, pass)),
         _ => smtp_client,
     };
 
-    let smtp_client = match &CONFIG.smtp_auth_mechanism() {
-        Some(auth_mechanism_json) => {
-            let auth_mechanism = serde_json::from_str::<SmtpAuthMechanism>(&auth_mechanism_json);
-            match auth_mechanism {
-                Ok(auth_mechanism) => smtp_client.authentication_mechanism(auth_mechanism),
+    let smtp_client = match CONFIG.smtp_auth_mechanism() {
+        Some(mechanism) => {
+            let correct_mechanism = format!("\"{}\"", crate::util::upcase_first(mechanism.trim_matches('"')));
+
+            // TODO: Allow more than one mechanism
+            match serde_json::from_str::<SmtpAuthMechanism>(&correct_mechanism) {
+                Ok(auth_mechanism) => smtp_client.authentication(vec![auth_mechanism]),
                 _ => panic!("Failure to parse mechanism. Is it proper Json? Eg. `\"Plain\"` not `Plain`"),
             }
         }
         _ => smtp_client,
     };
 
-    smtp_client
-        .smtp_utf8(true)
-        .timeout(Some(Duration::from_secs(CONFIG.smtp_timeout())))
-        .connection_reuse(ConnectionReuseParameters::NoReuse)
-        .transport()
+    smtp_client.timeout(Some(Duration::from_secs(CONFIG.smtp_timeout()))).build()
 }
 
 fn get_text(template_name: &'static str, data: serde_json::Value) -> Result<(String, String, String), Error> {
@@ -92,7 +90,7 @@ pub fn send_password_hint(address: &str, hint: Option<String>) -> EmptyResult {
 
     let (subject, body_html, body_text) = get_text(template_name, json!({ "hint": hint, "url": CONFIG.domain() }))?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_delete_account(address: &str, uuid: &str) -> EmptyResult {
@@ -109,7 +107,7 @@ pub fn send_delete_account(address: &str, uuid: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_verify_email(address: &str, uuid: &str) -> EmptyResult {
@@ -126,7 +124,7 @@ pub fn send_verify_email(address: &str, uuid: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_welcome(address: &str) -> EmptyResult {
@@ -137,7 +135,7 @@ pub fn send_welcome(address: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_welcome_must_verify(address: &str, uuid: &str) -> EmptyResult {
@@ -153,7 +151,7 @@ pub fn send_welcome_must_verify(address: &str, uuid: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_invite(
@@ -185,7 +183,7 @@ pub fn send_invite(
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_invite_accepted(new_user_email: &str, address: &str, org_name: &str) -> EmptyResult {
@@ -198,7 +196,7 @@ pub fn send_invite_accepted(new_user_email: &str, address: &str, org_name: &str)
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_invite_confirmed(address: &str, org_name: &str) -> EmptyResult {
@@ -210,7 +208,7 @@ pub fn send_invite_confirmed(address: &str, org_name: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_new_device_logged_in(address: &str, ip: &str, dt: &NaiveDateTime, device: &str) -> EmptyResult {
@@ -229,7 +227,7 @@ pub fn send_new_device_logged_in(address: &str, ip: &str, dt: &NaiveDateTime, de
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_token(address: &str, token: &str) -> EmptyResult {
@@ -241,7 +239,7 @@ pub fn send_token(address: &str, token: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 pub fn send_change_email(address: &str, token: &str) -> EmptyResult {
@@ -253,43 +251,62 @@ pub fn send_change_email(address: &str, token: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(&address, &subject, &body_html, &body_text)
+    send_email(address, &subject, &body_html, &body_text)
+}
+
+pub fn send_test(address: &str) -> EmptyResult {
+    let (subject, body_html, body_text) = get_text(
+        "email/smtp_test",
+        json!({
+            "url": CONFIG.domain(),
+        }),
+    )?;
+
+    send_email(address, &subject, &body_html, &body_text)
 }
 
 fn send_email(address: &str, subject: &str, body_html: &str, body_text: &str) -> EmptyResult {
-    let html = PartBuilder::new()
-        .body(encode_to_str(body_html))
-        .header(("Content-Type", "text/html; charset=utf-8"))
-        .header(("Content-Transfer-Encoding", "quoted-printable"))
-        .build();
+    let address_split: Vec<&str> = address.rsplitn(2, '@').collect();
+    if address_split.len() != 2 {
+        err!("Invalid email address (no @)");
+    }
 
-    let text = PartBuilder::new()
-        .body(encode_to_str(body_text))
-        .header(("Content-Type", "text/plain; charset=utf-8"))
-        .header(("Content-Transfer-Encoding", "quoted-printable"))
-        .build();
+    let domain_puny = match idna::domain_to_ascii_strict(address_split[0]) {
+        Ok(d) => d,
+        Err(_) => err!("Can't convert email domain to ASCII representation"),
+    };
 
-    let alternative = PartBuilder::new()
-        .message_type(MimeMultipartType::Alternative)
-        .child(text)
-        .child(html);
+    let address = format!("{}@{}", address_split[1], domain_puny);
 
-    let email = EmailBuilder::new()
-        .to(address)
-        .from((CONFIG.smtp_from().as_str(), CONFIG.smtp_from_name().as_str()))
+    let data = MultiPart::mixed()
+        .multipart(
+            MultiPart::alternative()
+                .singlepart(
+                    SinglePart::quoted_printable()
+                        .header(header::ContentType("text/plain; charset=utf-8".parse()?))
+                        .body(body_text),
+                )
+                .multipart(
+                    MultiPart::related().singlepart(
+                        SinglePart::quoted_printable()
+                            .header(header::ContentType("text/html; charset=utf-8".parse()?))
+                            .body(body_html),
+                    )
+                    // .singlepart(SinglePart::base64() -- Inline files would go here
+                ),
+        )
+        // .singlepart(SinglePart::base64()  -- Attachments would go here
+        ;
+
+    let email = Message::builder()
+        .to(Mailbox::new(None, Address::from_str(&address)?))
+        .from(Mailbox::new(
+            Some(CONFIG.smtp_from_name()),
+            Address::from_str(&CONFIG.smtp_from())?,
+        ))
         .subject(subject)
-        .child(alternative.build())
-        .build()
-        .map_err(|e| Error::new("Error building email", e.to_string()))?;
+        .multipart(data)?;
 
-    let mut transport = mailer();
-
-    let result = transport
-        .send(email.into())
-        .map_err(|e| Error::new("Error sending email", e.to_string()))
-        .and(Ok(()));
-
-    // Explicitly close the connection, in case of error
-    transport.close();
-    result
+    let _ = mailer().send(&email)?;
+    Ok(())
 }

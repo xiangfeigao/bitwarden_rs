@@ -37,7 +37,17 @@ fn app_id() -> Cached<Content<Json<Value>>> {
             {
             "version": { "major": 1, "minor": 0 },
             "ids": [
-                &CONFIG.domain(),
+                // Per <https://fidoalliance.org/specs/fido-v2.0-id-20180227/fido-appid-and-facets-v2.0-id-20180227.html#determining-the-facetid-of-a-calling-application>:
+                //
+                // "In the Web case, the FacetID MUST be the Web Origin [RFC6454]
+                // of the web page triggering the FIDO operation, written as
+                // a URI with an empty path. Default ports are omitted and any
+                // path component is ignored."
+                //
+                // This leaves it unclear as to whether the path must be empty,
+                // or whether it can be non-empty and will be ignored. To be on
+                // the safe side, use a proper web origin (with empty path).
+                &CONFIG.domain_origin(),
                 "ios:bundle-id:com.8bit.bitwarden",
                 "android:apk-key-hash:dUGFzUzf3lmHSLBDBIv+WaFyZMI" ]
             }]
@@ -68,6 +78,7 @@ fn static_files(filename: String) -> Result<Content<&'static [u8]>, Error> {
     match filename.as_ref() {
         "mail-github.png" => Ok(Content(ContentType::PNG, include_bytes!("../static/images/mail-github.png"))),
         "logo-gray.png" => Ok(Content(ContentType::PNG, include_bytes!("../static/images/logo-gray.png"))),
+        "shield-white.png" => Ok(Content(ContentType::PNG, include_bytes!("../static/images/shield-white.png"))),
         "error-x.svg" => Ok(Content(ContentType::SVG, include_bytes!("../static/images/error-x.svg"))),
         "hibp.png" => Ok(Content(ContentType::PNG, include_bytes!("../static/images/hibp.png"))),
 
@@ -75,6 +86,6 @@ fn static_files(filename: String) -> Result<Content<&'static [u8]>, Error> {
         "bootstrap-native-v4.js" => Ok(Content(ContentType::JavaScript, include_bytes!("../static/scripts/bootstrap-native-v4.js"))),
         "md5.js" => Ok(Content(ContentType::JavaScript, include_bytes!("../static/scripts/md5.js"))),
         "identicon.js" => Ok(Content(ContentType::JavaScript, include_bytes!("../static/scripts/identicon.js"))),
-        _ => err!("Image not found"),
+        _ => err!(format!("Static file not found: {}", filename)),
     }
 }

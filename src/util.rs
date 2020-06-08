@@ -7,6 +7,8 @@ use rocket::response::{self, Responder};
 use rocket::{Data, Request, Response, Rocket};
 use std::io::Cursor;
 
+use crate::CONFIG;
+
 pub struct AppHeaders();
 
 impl Fairing for AppHeaders {
@@ -23,7 +25,7 @@ impl Fairing for AppHeaders {
         res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
         res.set_raw_header("X-Content-Type-Options", "nosniff");
         res.set_raw_header("X-XSS-Protection", "1; mode=block");
-        let csp = "frame-ancestors 'self' chrome-extension://nngceckbapebfimnlniiiahkandclblb moz-extension://*;";
+        let csp = format!("frame-ancestors 'self' chrome-extension://nngceckbapebfimnlniiiahkandclblb moz-extension://* {};", CONFIG.allowed_iframe_ancestors());
         res.set_raw_header("Content-Security-Policy", csp);
 
         // Disable cache unless otherwise specified
@@ -63,13 +65,13 @@ impl Fairing for CORS {
         let req_headers = request.headers();
 
         // We need to explicitly get the Origin header for Access-Control-Allow-Origin
-        let req_allow_origin = CORS::valid_url(CORS::get_header(&req_headers, "Origin"));
+        let req_allow_origin = CORS::valid_url(CORS::get_header(req_headers, "Origin"));
 
         response.set_header(Header::new("Access-Control-Allow-Origin", req_allow_origin));
 
         if request.method() == Method::Options {
-            let req_allow_headers = CORS::get_header(&req_headers, "Access-Control-Request-Headers");
-            let req_allow_method = CORS::get_header(&req_headers, "Access-Control-Request-Method");
+            let req_allow_headers = CORS::get_header(req_headers, "Access-Control-Request-Headers");
+            let req_allow_method = CORS::get_header(req_headers, "Access-Control-Request-Method");
 
             response.set_header(Header::new("Access-Control-Allow-Methods", req_allow_method));
             response.set_header(Header::new("Access-Control-Allow-Headers", req_allow_headers));
@@ -84,14 +86,14 @@ impl Fairing for CORS {
 pub struct Cached<R>(R, &'static str);
 
 impl<R> Cached<R> {
-    pub fn long(r: R) -> Cached<R> {
+    pub const fn long(r: R) -> Cached<R> {
         // 7 days
-        Cached(r, "public, max-age=604800")
+        Self(r, "public, max-age=604800")
     }
 
-    pub fn short(r: R) -> Cached<R> {
+    pub const fn short(r: R) -> Cached<R> {
         // 10 minutes
-        Cached(r, "public, max-age=600")
+        Self(r, "public, max-age=600")
     }
 }
 
@@ -107,7 +109,7 @@ impl<'r, R: Responder<'r>> Responder<'r> for Cached<R> {
     }
 }
 
-// Log all the routes from the main base paths list, and the attachments endoint
+// Log all the routes from the main paths list, and the attachments endpoint
 // Effectively ignores, any static file route, and the alive endpoint
 const LOGGED_ROUTES: [&str; 6] = [
     "/api",
@@ -131,7 +133,9 @@ impl Fairing for BetterLogging {
     fn on_launch(&self, rocket: &Rocket) {
         if self.0 {
             info!(target: "routes", "Routes loaded:");
-            for route in rocket.routes() {
+            let mut routes: Vec<_> = rocket.routes().collect();
+            routes.sort_by_key(|r| r.uri.path());
+            for route in routes {
                 if route.rank < 0 {
                     info!(target: "routes", "{:<6} {}", route.method, route.uri);
                 } else {
@@ -153,7 +157,10 @@ impl Fairing for BetterLogging {
         }
         let uri = request.uri();
         let uri_path = uri.path();
-        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_path.starts_with(r)) {
+        // FIXME: trim_start_matches() could result in over-trimming in pathological cases;
+        // strip_prefix() would be a better option once it's stable.
+        let uri_subpath = uri_path.trim_start_matches(&CONFIG.domain_path());
+        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             match uri.query() {
                 Some(q) => info!(target: "request", "{} {}?{}", method, uri_path, &q[..q.len().min(30)]),
                 None => info!(target: "request", "{} {}", method, uri_path),
@@ -165,10 +172,12 @@ impl Fairing for BetterLogging {
         if !self.0 && request.method() == Method::Options {
             return;
         }
-        let uri_path = request.uri().path();
-        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_path.starts_with(r)) {
+        // FIXME: trim_start_matches() could result in over-trimming in pathological cases;
+        // strip_prefix() would be a better option once it's stable.
+        let uri_subpath = request.uri().path().trim_start_matches(&CONFIG.domain_path());
+        if self.0 || LOGGED_ROUTES.iter().any(|r| uri_subpath.starts_with(r)) {
             let status = response.status();
-            if let Some(ref route) = request.route() {
+            if let Some(route) = request.route() {
                 info!(target: "response", "{} => {} {}", route, status.code, status.reason)
             } else {
                 info!(target: "response", "{} {}", status.code, status.reason)
@@ -218,33 +227,6 @@ pub fn delete_file(path: &str) -> IOResult<()> {
     res
 }
 
-pub struct LimitedReader<'a> {
-    reader: &'a mut dyn std::io::Read,
-    limit: usize, // In bytes
-    count: usize,
-}
-impl<'a> LimitedReader<'a> {
-    pub fn new(reader: &'a mut dyn std::io::Read, limit: usize) -> LimitedReader<'a> {
-        LimitedReader {
-            reader,
-            limit,
-            count: 0,
-        }
-    }
-}
-
-impl<'a> std::io::Read for LimitedReader<'a> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.count += buf.len();
-
-        if self.count > self.limit {
-            Ok(0) // End of the read
-        } else {
-            self.reader.read(buf)
-        }
-    }
-}
-
 const UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
 
 pub fn get_display_size(size: i32) -> String {
@@ -260,9 +242,7 @@ pub fn get_display_size(size: i32) -> String {
         }
     }
 
-    // Round to two decimals
-    size = (size * 100.).round() / 100.;
-    format!("{} {}", size, UNITS[unit_counter])
+    format!("{:.2} {}", size, UNITS[unit_counter])
 }
 
 pub fn get_uuid() -> String {
@@ -307,6 +287,17 @@ where
     V: FromStr,
 {
     try_parse_string(env::var(key))
+}
+
+const TRUE_VALUES: &[&str] = &["true", "t", "yes", "y", "1"];
+const FALSE_VALUES: &[&str] = &["false", "f", "no", "n", "0"];
+
+pub fn get_env_bool(key: &str) -> Option<bool> {
+    match env::var(key) {
+        Ok(val) if TRUE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(true),
+        Ok(val) if FALSE_VALUES.contains(&val.to_lowercase().as_ref()) => Some(false),
+        _ => None,
+    }
 }
 
 //

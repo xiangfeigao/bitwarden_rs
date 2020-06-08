@@ -1,3 +1,4 @@
+use once_cell::sync::Lazy;
 use std::fs::{create_dir_all, remove_file, symlink_metadata, File};
 use std::io::prelude::*;
 use std::net::ToSocketAddrs;
@@ -7,7 +8,7 @@ use rocket::http::ContentType;
 use rocket::response::Content;
 use rocket::Route;
 
-use reqwest::{header::HeaderMap, Client, Response, Url};
+use reqwest::{Url, header::HeaderMap, blocking::Client, blocking::Response};
 
 use rocket::http::Cookie;
 
@@ -16,6 +17,7 @@ use soup::prelude::*;
 
 use crate::error::Error;
 use crate::CONFIG;
+use crate::util::Cached;
 
 pub fn routes() -> Vec<Route> {
     routes![icon]
@@ -25,16 +27,14 @@ const FALLBACK_ICON: &[u8; 344] = include_bytes!("../static/fallback-icon.png");
 
 const ALLOWED_CHARS: &str = "_-.";
 
-lazy_static! {
+static CLIENT: Lazy<Client> = Lazy::new(|| {
     // Reuse the client between requests
-    static ref CLIENT: Client = Client::builder()
-        .use_sys_proxy()
-        .gzip(true)
+    Client::builder()
         .timeout(Duration::from_secs(CONFIG.icon_download_timeout()))
         .default_headers(_header_map())
         .build()
-        .unwrap();
-}
+        .unwrap()
+});
 
 fn is_valid_domain(domain: &str) -> bool {
     // Don't allow empty or too big domains or path traversal
@@ -53,15 +53,15 @@ fn is_valid_domain(domain: &str) -> bool {
 }
 
 #[get("/<domain>/icon.png")]
-fn icon(domain: String) -> Content<Vec<u8>> {
+fn icon(domain: String) -> Cached<Content<Vec<u8>>> {
     let icon_type = ContentType::new("image", "x-icon");
 
     if !is_valid_domain(&domain) {
         warn!("Invalid domain: {:#?}", domain);
-        return Content(icon_type, FALLBACK_ICON.to_vec());
+        return Cached::long(Content(icon_type, FALLBACK_ICON.to_vec()));
     }
 
-    Content(icon_type, get_icon(&domain))
+    Cached::long(Content(icon_type, get_icon(&domain)))
 }
 
 fn check_icon_domain_is_blacklisted(domain: &str) -> bool {
@@ -182,7 +182,7 @@ struct Icon {
 }
 
 impl Icon {
-    fn new(priority: u8, href: String) -> Self {
+    const fn new(priority: u8, href: String) -> Self {
         Self { href, priority }
     }
 }
@@ -213,7 +213,7 @@ fn get_icon_url(domain: &str) -> Result<(Vec<Icon>, String), Error> {
     let mut cookie_str = String::new();
 
     let resp = get_page(&ssldomain).or_else(|_| get_page(&httpdomain));
-    if let Ok(mut content) = resp {
+    if let Ok(content) = resp {
         // Extract the URL from the respose in case redirects occured (like @ gitlab.com)
         let url = content.url().clone();
 
@@ -235,7 +235,7 @@ fn get_icon_url(domain: &str) -> Result<(Vec<Icon>, String), Error> {
 
         // 512KB should be more than enough for the HTML, though as we only really need
         // the HTML header, it could potentially be reduced even further
-        let limited_reader = crate::util::LimitedReader::new(&mut content, 512 * 1024);
+        let limited_reader = content.take(512 * 1024);
 
         let soup = Soup::from_reader(limited_reader)?;
         // Search for and filter

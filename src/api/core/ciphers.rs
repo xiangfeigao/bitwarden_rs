@@ -49,10 +49,16 @@ pub fn routes() -> Vec<Route> {
         put_cipher,
         delete_cipher_post,
         delete_cipher_post_admin,
+        delete_cipher_put,
+        delete_cipher_put_admin,
         delete_cipher,
         delete_cipher_admin,
         delete_cipher_selected,
         delete_cipher_selected_post,
+        delete_cipher_selected_put,
+        restore_cipher_put,
+        restore_cipher_put_admin,
+        restore_cipher_selected,
         delete_all,
         move_cipher_selected,
         move_cipher_selected_put,
@@ -79,6 +85,9 @@ fn sync(data: Form<SyncData>, headers: Headers, conn: DbConn) -> JsonResult {
     let collections = Collection::find_by_user_uuid(&headers.user.uuid, &conn);
     let collections_json: Vec<Value> = collections.iter().map(Collection::to_json).collect();
 
+    let policies = OrgPolicy::find_by_user(&headers.user.uuid, &conn);
+    let policies_json: Vec<Value> = policies.iter().map(OrgPolicy::to_json).collect();
+
     let ciphers = Cipher::find_by_user(&headers.user.uuid, &conn);
     let ciphers_json: Vec<Value> = ciphers
         .iter()
@@ -95,6 +104,7 @@ fn sync(data: Form<SyncData>, headers: Headers, conn: DbConn) -> JsonResult {
         "Profile": user_json,
         "Folders": folders_json,
         "Collections": collections_json,
+        "Policies": policies_json,
         "Ciphers": ciphers_json,
         "Domains": domains_json,
         "Object": "sync"
@@ -264,7 +274,10 @@ pub fn update_cipher_from_data(
             };
 
             if saved_att.cipher_uuid != cipher.uuid {
-                err!("Attachment is not owned by the cipher")
+                // Warn and break here since cloning ciphers provides attachment data but will not be cloned.
+                // If we error out here it will break the whole cloning and causes empty ciphers to appear.
+                warn!("Attachment is not owned by the cipher");
+                break;
             }
 
             saved_att.akey = Some(attachment.Key);
@@ -599,10 +612,14 @@ fn share_cipher_by_uuid(
         None => err!("Cipher doesn't exist"),
     };
 
+    let mut shared_to_collection = false;
+
     match data.Cipher.OrganizationId.clone() {
-        None => err!("Organization id not provided"),
+        // If we don't get an organization ID, we don't do anything
+        // No error because this is used when using the Clone functionality
+        None => {},
         Some(organization_uuid) => {
-            let mut shared_to_collection = false;
+
             for uuid in &data.CollectionIds {
                 match Collection::find_by_uuid_and_org(uuid, &organization_uuid, &conn) {
                     None => err!("Invalid collection ID provided"),
@@ -616,19 +633,20 @@ fn share_cipher_by_uuid(
                     }
                 }
             }
-            update_cipher_from_data(
-                &mut cipher,
-                data.Cipher,
-                &headers,
-                shared_to_collection,
-                &conn,
-                &nt,
-                UpdateType::CipherUpdate,
-            )?;
-
-            Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, &conn)))
         }
-    }
+    };
+
+    update_cipher_from_data(
+        &mut cipher,
+        data.Cipher,
+        &headers,
+        shared_to_collection,
+        &conn,
+        &nt,
+        UpdateType::CipherUpdate,
+    )?;
+
+    Ok(Json(cipher.to_json(&headers.host, &headers.user.uuid, &conn)))
 }
 
 #[post("/ciphers/<uuid>/attachment", format = "multipart/form-data", data = "<data>")]
@@ -642,20 +660,49 @@ fn post_attachment(
 ) -> JsonResult {
     let cipher = match Cipher::find_by_uuid(&uuid, &conn) {
         Some(cipher) => cipher,
-        None => err!("Cipher doesn't exist"),
+        None => err_discard!("Cipher doesn't exist", data),
     };
 
     if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn) {
-        err!("Cipher is not write accessible")
+        err_discard!("Cipher is not write accessible", data)
     }
 
     let mut params = content_type.params();
     let boundary_pair = params.next().expect("No boundary provided");
     let boundary = boundary_pair.1;
 
+    let size_limit = if let Some(ref user_uuid) = cipher.user_uuid {
+        match CONFIG.user_attachment_limit() {
+            Some(0) => err_discard!("Attachments are disabled", data),
+            Some(limit_kb) => {
+                let left = (limit_kb * 1024) - Attachment::size_by_user(user_uuid, &conn);
+                if left <= 0 {
+                    err_discard!("Attachment size limit reached! Delete some files to open space", data)
+                }
+                Some(left as u64)
+            }
+            None => None,
+        }
+    } else if let Some(ref org_uuid) = cipher.organization_uuid {
+        match CONFIG.org_attachment_limit() {
+            Some(0) => err_discard!("Attachments are disabled", data),
+            Some(limit_kb) => {
+                let left = (limit_kb * 1024) - Attachment::size_by_org(org_uuid, &conn);
+                if left <= 0 {
+                    err_discard!("Attachment size limit reached! Delete some files to open space", data)
+                }
+                Some(left as u64)
+            }
+            None => None,
+        }
+    } else {
+        err_discard!("Cipher is neither owned by a user nor an organization", data);
+    };
+
     let base_path = Path::new(&CONFIG.attachments_folder()).join(&cipher.uuid);
 
     let mut attachment_key = None;
+    let mut error = None;
 
     Multipart::with_body(data.open(), boundary)
         .foreach_entry(|mut field| {
@@ -674,18 +721,21 @@ fn post_attachment(
                     let file_name = HEXLOWER.encode(&crypto::get_random(vec![0; 10]));
                     let path = base_path.join(&file_name);
 
-                    let size = match field.data.save().memory_threshold(0).size_limit(None).with_path(path) {
+                    let size = match field.data.save().memory_threshold(0).size_limit(size_limit).with_path(path.clone()) {
                         SaveResult::Full(SavedData::File(_, size)) => size as i32,
                         SaveResult::Full(other) => {
-                            error!("Attachment is not a file: {:?}", other);
+                            std::fs::remove_file(path).ok();
+                            error = Some(format!("Attachment is not a file: {:?}", other));
                             return;
                         }
                         SaveResult::Partial(_, reason) => {
-                            error!("Partial result: {:?}", reason);
+                            std::fs::remove_file(path).ok();
+                            error = Some(format!("Attachment size limit exceeded with this file: {:?}", reason));
                             return;
                         }
                         SaveResult::Error(e) => {
-                            error!("Error: {:?}", e);
+                            std::fs::remove_file(path).ok();
+                            error = Some(format!("Error: {:?}", e));
                             return;
                         }
                     };
@@ -698,6 +748,10 @@ fn post_attachment(
             }
         })
         .expect("Error processing multipart data");
+
+    if let Some(ref e) = error {
+        err!(e);
+    }
 
     nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(&conn));
 
@@ -716,11 +770,7 @@ fn post_attachment_admin(
     post_attachment(uuid, data, content_type, headers, conn, nt)
 }
 
-#[post(
-    "/ciphers/<uuid>/attachment/<attachment_id>/share",
-    format = "multipart/form-data",
-    data = "<data>"
-)]
+#[post("/ciphers/<uuid>/attachment/<attachment_id>/share", format = "multipart/form-data", data = "<data>")]
 fn post_attachment_share(
     uuid: String,
     attachment_id: String,
@@ -774,48 +824,62 @@ fn delete_attachment_admin(
 
 #[post("/ciphers/<uuid>/delete")]
 fn delete_cipher_post(uuid: String, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
-    _delete_cipher_by_uuid(&uuid, &headers, &conn, &nt)
+    _delete_cipher_by_uuid(&uuid, &headers, &conn, false, &nt)
 }
 
 #[post("/ciphers/<uuid>/delete-admin")]
 fn delete_cipher_post_admin(uuid: String, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
-    _delete_cipher_by_uuid(&uuid, &headers, &conn, &nt)
+    _delete_cipher_by_uuid(&uuid, &headers, &conn, false, &nt)
+}
+
+#[put("/ciphers/<uuid>/delete")]
+fn delete_cipher_put(uuid: String, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
+    _delete_cipher_by_uuid(&uuid, &headers, &conn, true, &nt)
+}
+
+#[put("/ciphers/<uuid>/delete-admin")]
+fn delete_cipher_put_admin(uuid: String, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
+    _delete_cipher_by_uuid(&uuid, &headers, &conn, true, &nt)
 }
 
 #[delete("/ciphers/<uuid>")]
 fn delete_cipher(uuid: String, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
-    _delete_cipher_by_uuid(&uuid, &headers, &conn, &nt)
+    _delete_cipher_by_uuid(&uuid, &headers, &conn, false, &nt)
 }
 
 #[delete("/ciphers/<uuid>/admin")]
 fn delete_cipher_admin(uuid: String, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
-    _delete_cipher_by_uuid(&uuid, &headers, &conn, &nt)
+    _delete_cipher_by_uuid(&uuid, &headers, &conn, false, &nt)
 }
 
 #[delete("/ciphers", data = "<data>")]
 fn delete_cipher_selected(data: JsonUpcase<Value>, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
-    let data: Value = data.into_inner().data;
-
-    let uuids = match data.get("Ids") {
-        Some(ids) => match ids.as_array() {
-            Some(ids) => ids.iter().filter_map(Value::as_str),
-            None => err!("Posted ids field is not an array"),
-        },
-        None => err!("Request missing ids field"),
-    };
-
-    for uuid in uuids {
-        if let error @ Err(_) = _delete_cipher_by_uuid(uuid, &headers, &conn, &nt) {
-            return error;
-        };
-    }
-
-    Ok(())
+    _delete_multiple_ciphers(data, headers, conn, false, nt)
 }
 
 #[post("/ciphers/delete", data = "<data>")]
 fn delete_cipher_selected_post(data: JsonUpcase<Value>, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
-    delete_cipher_selected(data, headers, conn, nt)
+    _delete_multiple_ciphers(data, headers, conn, false, nt)
+}
+
+#[put("/ciphers/delete", data = "<data>")]
+fn delete_cipher_selected_put(data: JsonUpcase<Value>, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
+    _delete_multiple_ciphers(data, headers, conn, true, nt)
+}
+
+#[put("/ciphers/<uuid>/restore")]
+fn restore_cipher_put(uuid: String, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
+    _restore_cipher_by_uuid(&uuid, &headers, &conn, &nt)
+}
+
+#[put("/ciphers/<uuid>/restore-admin")]
+fn restore_cipher_put_admin(uuid: String, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
+    _restore_cipher_by_uuid(&uuid, &headers, &conn, &nt)
+}
+
+#[put("/ciphers/restore", data = "<data>")]
+fn restore_cipher_selected(data: JsonUpcase<Value>, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
+    _restore_multiple_ciphers(data, headers, conn, nt)
 }
 
 #[derive(Deserialize)]
@@ -929,8 +993,8 @@ fn delete_all(
     }
 }
 
-fn _delete_cipher_by_uuid(uuid: &str, headers: &Headers, conn: &DbConn, nt: &Notify) -> EmptyResult {
-    let cipher = match Cipher::find_by_uuid(&uuid, &conn) {
+fn _delete_cipher_by_uuid(uuid: &str, headers: &Headers, conn: &DbConn, soft_delete: bool, nt: &Notify) -> EmptyResult {
+    let mut cipher = match Cipher::find_by_uuid(&uuid, &conn) {
         Some(cipher) => cipher,
         None => err!("Cipher doesn't exist"),
     };
@@ -939,8 +1003,71 @@ fn _delete_cipher_by_uuid(uuid: &str, headers: &Headers, conn: &DbConn, nt: &Not
         err!("Cipher can't be deleted by user")
     }
 
-    cipher.delete(&conn)?;
+    if soft_delete {
+        cipher.deleted_at = Some(chrono::Utc::now().naive_utc());
+        cipher.save(&conn)?;
+    } else {
+        cipher.delete(&conn)?;
+    }
+
     nt.send_cipher_update(UpdateType::CipherDelete, &cipher, &cipher.update_users_revision(&conn));
+    Ok(())
+}
+
+fn _delete_multiple_ciphers(data: JsonUpcase<Value>, headers: Headers, conn: DbConn, soft_delete: bool, nt: Notify) -> EmptyResult {
+    let data: Value = data.into_inner().data;
+
+    let uuids = match data.get("Ids") {
+        Some(ids) => match ids.as_array() {
+            Some(ids) => ids.iter().filter_map(Value::as_str),
+            None => err!("Posted ids field is not an array"),
+        },
+        None => err!("Request missing ids field"),
+    };
+
+    for uuid in uuids {
+        if let error @ Err(_) = _delete_cipher_by_uuid(uuid, &headers, &conn, soft_delete, &nt) {
+            return error;
+        };
+    }
+
+    Ok(())
+}
+
+fn _restore_cipher_by_uuid(uuid: &str, headers: &Headers, conn: &DbConn, nt: &Notify) -> EmptyResult {
+    let mut cipher = match Cipher::find_by_uuid(&uuid, &conn) {
+        Some(cipher) => cipher,
+        None => err!("Cipher doesn't exist"),
+    };
+
+    if !cipher.is_write_accessible_to_user(&headers.user.uuid, &conn) {
+        err!("Cipher can't be restored by user")
+    }
+
+    cipher.deleted_at = None;
+    cipher.save(&conn)?;
+
+    nt.send_cipher_update(UpdateType::CipherUpdate, &cipher, &cipher.update_users_revision(&conn));
+    Ok(())
+}
+
+fn _restore_multiple_ciphers(data: JsonUpcase<Value>, headers: Headers, conn: DbConn, nt: Notify) -> EmptyResult {
+    let data: Value = data.into_inner().data;
+
+    let uuids = match data.get("Ids") {
+        Some(ids) => match ids.as_array() {
+            Some(ids) => ids.iter().filter_map(Value::as_str),
+            None => err!("Posted ids field is not an array"),
+        },
+        None => err!("Request missing ids field"),
+    };
+
+    for uuid in uuids {
+        if let error @ Err(_) = _restore_cipher_by_uuid(uuid, &headers, &conn, &nt) {
+            return error;
+        };
+    }
+
     Ok(())
 }
 

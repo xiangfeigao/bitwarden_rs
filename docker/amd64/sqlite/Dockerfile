@@ -5,31 +5,17 @@
 # 	https://docs.docker.com/develop/develop-images/multistage-build/
 # 	https://whitfin.io/speeding-up-rust-docker-builds/
 ####################### VAULT BUILD IMAGE  #######################
-FROM rust:1.40 as vault
 
-ENV VAULT_VERSION "v2.12.0b"
-
-ENV URL "https://github.com/dani-garcia/bw_web_builds/releases/download/$VAULT_VERSION/bw_web_$VAULT_VERSION.tar.gz"
-
-# Build time options to avoid dpkg warnings and help with reproducible builds.
-ARG DEBIAN_FRONTEND=noninteractive
-ARG LANG=C.UTF-8
-ARG TZ=UTC
-ARG TERM=xterm-256color
-
-RUN apt-get update \
-    && apt-get install -y \
-        --no-install-recommends \
-        curl \
-        tar
-
-RUN mkdir /web-vault
-WORKDIR /web-vault
-
-SHELL ["/bin/bash", "-o", "nounset", "-o", "pipefail", "-o", "errexit", "-c"]
-
-RUN curl -L $URL | tar xz
-RUN ls
+#  This hash is extracted from the docker web-vault builds and it's prefered over a simple tag because it's immutable.
+#  It can be viewed in multiple ways:
+#  - From the https://hub.docker.com/repository/docker/bitwardenrs/web-vault/tags page, click the tag name and the digest should be there.
+#  - From the console, with the following commands:
+#      docker pull bitwardenrs/web-vault:v2.14.0
+#      docker image inspect --format "{{.RepoDigests}}" bitwardenrs/web-vault:v2.14.0
+#
+#  - To do the opposite, and get the tag from the hash, you can do:
+#      docker image inspect --format "{{.RepoTags}}" bitwardenrs/web-vault@sha256:c62e0b8698562e03fe2759374f3ecd760d9612e4eaf0af4583f231ebf05d6df5
+FROM bitwardenrs/web-vault@sha256:c62e0b8698562e03fe2759374f3ecd760d9612e4eaf0af4583f231ebf05d6df5 as vault
 
 ########################## BUILD IMAGE  ##########################
 # We need to use the Rust build image, because
@@ -40,10 +26,7 @@ FROM rust:1.40 as build
 ARG DB=sqlite
 
 # Build time options to avoid dpkg warnings and help with reproducible builds.
-ARG DEBIAN_FRONTEND=noninteractive
-ARG LANG=C.UTF-8
-ARG TZ=UTC
-ARG TERM=xterm-256color
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 TZ=UTC TERM=xterm-256color
 
 # Don't download rust docs
 RUN rustup set profile minimal
@@ -103,9 +86,9 @@ COPY Rocket.toml .
 COPY --from=vault /web-vault ./web-vault
 COPY --from=build app/target/release/bitwarden_rs .
 
-COPY docker/healthcheck.sh ./healthcheck.sh
+COPY docker/healthcheck.sh /healthcheck.sh
 
-HEALTHCHECK --interval=30s --timeout=3s CMD sh healthcheck.sh || exit 1
+HEALTHCHECK --interval=60s --timeout=10s CMD ["/healthcheck.sh"]
 
 # Configures the startup!
 WORKDIR /

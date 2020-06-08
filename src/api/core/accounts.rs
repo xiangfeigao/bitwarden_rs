@@ -68,7 +68,7 @@ fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
     let mut user = match User::find_by_mail(&data.Email, &conn) {
         Some(user) => {
             if !user.password_hash.is_empty() {
-                if CONFIG.signups_allowed() {
+                if CONFIG.is_signup_allowed(&data.Email) {
                     err!("User already exists")
                 } else {
                     err!("Registration not allowed or user already exists")
@@ -89,14 +89,17 @@ fn register(data: JsonUpcase<RegisterData>, conn: DbConn) -> EmptyResult {
                 }
 
                 user
-            } else if CONFIG.signups_allowed() {
+            } else if CONFIG.is_signup_allowed(&data.Email) {
                 err!("Account with this email already exists")
             } else {
                 err!("Registration not allowed or user already exists")
             }
         }
         None => {
-            if CONFIG.signups_allowed() || Invitation::take(&data.Email, &conn) || CONFIG.can_signup_user(&data.Email) {
+            // Order is important here; the invitation check must come first
+            // because the bitwarden_rs admin can invite anyone, regardless
+            // of other signup restrictions.
+            if Invitation::take(&data.Email, &conn) || CONFIG.is_signup_allowed(&data.Email) {
                 User::new(data.Email.clone())
             } else {
                 err!("Registration not allowed or user already exists")
@@ -207,7 +210,12 @@ fn post_keys(data: JsonUpcase<KeysData>, headers: Headers, conn: DbConn) -> Json
     user.public_key = Some(data.PublicKey);
 
     user.save(&conn)?;
-    Ok(Json(user.to_json(&conn)))
+
+    Ok(Json(json!({
+        "PrivateKey": user.private_key,
+        "PublicKey": user.public_key,
+        "Object":"keys"
+    })))
 }
 
 #[derive(Deserialize)]
@@ -371,8 +379,8 @@ fn post_email_token(data: JsonUpcase<EmailTokenData>, headers: Headers, conn: Db
         err!("Email already in use");
     }
 
-    if !CONFIG.signups_allowed() && !CONFIG.can_signup_user(&data.NewEmail) {
-        err!("Email cannot be changed to this address");
+    if !CONFIG.is_email_domain_allowed(&data.NewEmail) {
+        err!("Email domain not allowed");
     }
 
     let token = crypto::generate_token(6)?;

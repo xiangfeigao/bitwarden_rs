@@ -22,6 +22,7 @@ table! {
         data -> Text,
         favorite -> Bool,
         password_history -> Nullable<Text>,
+        deleted_at -> Nullable<Datetime>,
     }
 }
 
@@ -74,6 +75,16 @@ table! {
 table! {
     invitations (email) {
         email -> Varchar,
+    }
+}
+
+table! {
+    org_policies (uuid) {
+        uuid -> Varchar,
+        org_uuid -> Varchar,
+        atype -> Integer,
+        enabled -> Bool,
+        data -> Text,
     }
 }
 
@@ -155,6 +166,7 @@ joinable!(devices -> users (user_uuid));
 joinable!(folders -> users (user_uuid));
 joinable!(folders_ciphers -> ciphers (cipher_uuid));
 joinable!(folders_ciphers -> folders (folder_uuid));
+joinable!(org_policies -> organizations (org_uuid));
 joinable!(twofactor -> users (user_uuid));
 joinable!(users_collections -> collections (collection_uuid));
 joinable!(users_collections -> users (user_uuid));
@@ -170,6 +182,7 @@ allow_tables_to_appear_in_same_query!(
     folders,
     folders_ciphers,
     invitations,
+    org_policies,
     organizations,
     twofactor,
     users,

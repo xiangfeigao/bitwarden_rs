@@ -1,7 +1,7 @@
-#![feature(proc_macro_hygiene, vec_remove_item, try_trait, ip)]
+#![forbid(unsafe_code)]
+#![feature(proc_macro_hygiene, try_trait, ip)]
 #![recursion_limit = "256"]
 
-#[cfg(feature = "openssl")]
 extern crate openssl;
 #[macro_use]
 extern crate rocket;
@@ -15,18 +15,13 @@ extern crate log;
 extern crate diesel;
 #[macro_use]
 extern crate diesel_migrations;
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate derive_more;
-#[macro_use]
-extern crate num_derive;
 
 use std::{
     fs::create_dir_all,
     path::Path,
     process::{exit, Command},
     str::FromStr,
+    panic, thread, fmt // For panic logging
 };
 
 #[macro_use]
@@ -42,7 +37,28 @@ mod util;
 pub use config::CONFIG;
 pub use error::{Error, MapResult};
 
+use structopt::StructOpt;
+
+// Used for catching panics and log them to file instead of stderr
+use backtrace::Backtrace;
+struct Shim(Backtrace);
+
+impl fmt::Debug for Shim {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "\n{:?}", self.0)
+    }
+}
+
+#[derive(Debug, StructOpt)]
+#[structopt(name = "bitwarden_rs", about = "A Bitwarden API server written in Rust")]
+struct Opt {
+    /// Prints the app version
+    #[structopt(short, long)]
+    version: bool,
+}
+
 fn main() {
+    parse_args();
     launch_info();
 
     use log::LevelFilter as LF;
@@ -64,18 +80,33 @@ fn main() {
     launch_rocket(extra_debug);
 }
 
+fn parse_args() {
+    let opt = Opt::from_args();
+    if opt.version {
+        if let Some(version) = option_env!("BWRS_VERSION") {
+            println!("bitwarden_rs {}", version);
+        } else {
+            println!("bitwarden_rs (Version info from Git not present)");
+        }
+        exit(0);
+    }
+}
+
 fn launch_info() {
     println!("/--------------------------------------------------------------------\\");
     println!("|                       Starting Bitwarden_RS                        |");
 
-    if let Some(version) = option_env!("GIT_VERSION") {
+    if let Some(version) = option_env!("BWRS_VERSION") {
         println!("|{:^68}|", format!("Version {}", version));
     }
 
     println!("|--------------------------------------------------------------------|");
     println!("| This is an *unofficial* Bitwarden implementation, DO NOT use the   |");
     println!("| official channels to report bugs/features, regardless of client.   |");
-    println!("| Report URL: https://github.com/dani-garcia/bitwarden_rs/issues/new |");
+    println!("| Send usage/configuration questions or feature requests to:         |");
+    println!("|   https://bitwardenrs.discourse.group/                             |");
+    println!("| Report suspected bugs/issues in the software itself at:            |");
+    println!("|   https://github.com/dani-garcia/bitwarden_rs/issues/new           |");
     println!("\\--------------------------------------------------------------------/\n");
 }
 
@@ -120,6 +151,44 @@ fn init_logging(level: log::LevelFilter) -> Result<(), fern::InitError> {
     }
 
     logger.apply()?;
+
+    // Catch panics and log them instead of default output to StdErr
+    panic::set_hook(Box::new(|info| {
+        let backtrace = Backtrace::new();
+
+        let thread = thread::current();
+        let thread = thread.name().unwrap_or("unnamed");
+
+        let msg = match info.payload().downcast_ref::<&'static str>() {
+            Some(s) => *s,
+            None => match info.payload().downcast_ref::<String>() {
+                Some(s) => &**s,
+                None => "Box<Any>",
+            },
+        };
+
+        match info.location() {
+            Some(location) => {
+                error!(
+                    target: "panic", "thread '{}' panicked at '{}': {}:{}{:?}",
+                    thread,
+                    msg,
+                    location.file(),
+                    location.line(),
+                    Shim(backtrace)
+                );
+            }
+            None => {
+                error!(
+                    target: "panic",
+                    "thread '{}' panicked at '{}'{:?}",
+                    thread,
+                    msg,
+                    Shim(backtrace)
+                )
+            }
+        }
+    }));
 
     Ok(())
 }
@@ -177,7 +246,9 @@ fn check_rsa_keys() {
         info!("JWT keys don't exist, checking if OpenSSL is available...");
 
         Command::new("openssl").arg("version").status().unwrap_or_else(|_| {
-            info!("Can't create keys because OpenSSL is not available, make sure it's installed and available on the PATH");
+            info!(
+                "Can't create keys because OpenSSL is not available, make sure it's installed and available on the PATH"
+            );
             exit(1);
         });
 
@@ -250,23 +321,35 @@ mod migrations {
         let connection = crate::db::get_connection().expect("Can't connect to DB");
 
         use std::io::stdout;
+
+        // Disable Foreign Key Checks during migration
+        use diesel::RunQueryDsl;
+        #[cfg(feature = "postgres")]
+        diesel::sql_query("SET CONSTRAINTS ALL DEFERRED").execute(&connection).expect("Failed to disable Foreign Key Checks during migrations");
+        #[cfg(feature = "mysql")]
+        diesel::sql_query("SET FOREIGN_KEY_CHECKS = 0").execute(&connection).expect("Failed to disable Foreign Key Checks during migrations");
+        #[cfg(feature = "sqlite")]
+        diesel::sql_query("PRAGMA defer_foreign_keys = ON").execute(&connection).expect("Failed to disable Foreign Key Checks during migrations");
+
         embedded_migrations::run_with_output(&connection, &mut stdout()).expect("Can't run migrations");
     }
 }
 
 fn launch_rocket(extra_debug: bool) {
-    // Create Rocket object, this stores current log level and sets it's own
+    // Create Rocket object, this stores current log level and sets its own
     let rocket = rocket::ignite();
 
-    // If addding more base paths here, consider also adding them to
+    let basepath = &CONFIG.domain_path();
+
+    // If adding more paths here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
     let rocket = rocket
-        .mount("/", api::web_routes())
-        .mount("/api", api::core_routes())
-        .mount("/admin", api::admin_routes())
-        .mount("/identity", api::identity_routes())
-        .mount("/icons", api::icons_routes())
-        .mount("/notifications", api::notifications_routes())
+        .mount(&[basepath, "/"].concat(), api::web_routes())
+        .mount(&[basepath, "/api"].concat(), api::core_routes())
+        .mount(&[basepath, "/admin"].concat(), api::admin_routes())
+        .mount(&[basepath, "/identity"].concat(), api::identity_routes())
+        .mount(&[basepath, "/icons"].concat(), api::icons_routes())
+        .mount(&[basepath, "/notifications"].concat(), api::notifications_routes())
         .manage(db::init_pool())
         .manage(api::start_notification_server())
         .attach(util::AppHeaders())

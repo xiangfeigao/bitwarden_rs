@@ -3,8 +3,10 @@
 //
 use crate::util::read_file;
 use chrono::{Duration, Utc};
+use once_cell::sync::Lazy;
+use num_traits::FromPrimitive;
 
-use jsonwebtoken::{self, Algorithm, Header};
+use jsonwebtoken::{self, Algorithm, Header, EncodingKey, DecodingKey};
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
@@ -13,26 +15,24 @@ use crate::CONFIG;
 
 const JWT_ALGORITHM: Algorithm = Algorithm::RS256;
 
-lazy_static! {
-    pub static ref DEFAULT_VALIDITY: Duration = Duration::hours(2);
-    static ref JWT_HEADER: Header = Header::new(JWT_ALGORITHM);
-    pub static ref JWT_LOGIN_ISSUER: String = format!("{}|login", CONFIG.domain());
-    pub static ref JWT_INVITE_ISSUER: String = format!("{}|invite", CONFIG.domain());
-    pub static ref JWT_DELETE_ISSUER: String = format!("{}|delete", CONFIG.domain());
-    pub static ref JWT_VERIFYEMAIL_ISSUER: String = format!("{}|verifyemail", CONFIG.domain());
-    pub static ref JWT_ADMIN_ISSUER: String = format!("{}|admin", CONFIG.domain());
-    static ref PRIVATE_RSA_KEY: Vec<u8> = match read_file(&CONFIG.private_rsa_key()) {
-        Ok(key) => key,
-        Err(e) => panic!("Error loading private RSA Key.\n Error: {}", e),
-    };
-    static ref PUBLIC_RSA_KEY: Vec<u8> = match read_file(&CONFIG.public_rsa_key()) {
-        Ok(key) => key,
-        Err(e) => panic!("Error loading public RSA Key.\n Error: {}", e),
-    };
-}
+pub static DEFAULT_VALIDITY: Lazy<Duration> = Lazy::new(|| Duration::hours(2));
+static JWT_HEADER: Lazy<Header> = Lazy::new(|| Header::new(JWT_ALGORITHM));
+pub static JWT_LOGIN_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|login", CONFIG.domain_origin()));
+static JWT_INVITE_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|invite", CONFIG.domain_origin()));
+static JWT_DELETE_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|delete", CONFIG.domain_origin()));
+static JWT_VERIFYEMAIL_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|verifyemail", CONFIG.domain_origin()));
+static JWT_ADMIN_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|admin", CONFIG.domain_origin()));
+static PRIVATE_RSA_KEY: Lazy<Vec<u8>> = Lazy::new(|| match read_file(&CONFIG.private_rsa_key()) {
+    Ok(key) => key,
+    Err(e) => panic!("Error loading private RSA Key.\n Error: {}", e),
+});
+static PUBLIC_RSA_KEY: Lazy<Vec<u8>> = Lazy::new(|| match read_file(&CONFIG.public_rsa_key()) {
+    Ok(key) => key,
+    Err(e) => panic!("Error loading public RSA Key.\n Error: {}", e),
+});
 
 pub fn encode_jwt<T: Serialize>(claims: &T) -> String {
-    match jsonwebtoken::encode(&JWT_HEADER, claims, &PRIVATE_RSA_KEY) {
+    match jsonwebtoken::encode(&JWT_HEADER, claims, &EncodingKey::from_rsa_der(&PRIVATE_RSA_KEY)) {
         Ok(token) => token,
         Err(e) => panic!("Error encoding jwt {}", e),
     }
@@ -51,7 +51,7 @@ fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Err
 
     let token = token.replace(char::is_whitespace, "");
 
-    jsonwebtoken::decode(&token, &PUBLIC_RSA_KEY, &validation)
+    jsonwebtoken::decode(&token, &DecodingKey::from_rsa_der(&PUBLIC_RSA_KEY), &validation)
         .map(|d| d.claims)
         .map_res("Error decoding JWT")
 }
@@ -307,6 +307,25 @@ pub struct OrgHeaders {
     pub org_user_type: UserOrgType,
 }
 
+// org_id is usually the second param ("/organizations/<org_id>")
+// But there are cases where it is located in a query value.
+// First check the param, if this is not a valid uuid, we will try the query value.
+fn get_org_id(request: &Request) -> Option<String> {
+    if let Some(Ok(org_id)) = request.get_param::<String>(1) {
+        if uuid::Uuid::parse_str(&org_id).is_ok() {
+            return Some(org_id);
+        }
+    }
+
+    if let Some(Ok(org_id)) = request.get_query_value::<String>("organizationId") {
+        if uuid::Uuid::parse_str(&org_id).is_ok() {
+            return Some(org_id);
+        }
+    }
+
+    None
+}
+
 impl<'a, 'r> FromRequest<'a, 'r> for OrgHeaders {
     type Error = &'static str;
 
@@ -315,9 +334,8 @@ impl<'a, 'r> FromRequest<'a, 'r> for OrgHeaders {
             Outcome::Forward(_) => Outcome::Forward(()),
             Outcome::Failure(f) => Outcome::Failure(f),
             Outcome::Success(headers) => {
-                // org_id is expected to be the second param ("/organizations/<org_id>")
-                match request.get_param::<String>(1) {
-                    Some(Ok(org_id)) => {
+                match get_org_id(request) {
+                    Some(org_id) => {
                         let conn = match request.guard::<DbConn>() {
                             Outcome::Success(conn) => conn,
                             _ => err_handler!("Error getting DB"),
@@ -348,7 +366,7 @@ impl<'a, 'r> FromRequest<'a, 'r> for OrgHeaders {
                                 }
                             },
                         })
-                    }
+                    },
                     _ => err_handler!("Error getting the organization id"),
                 }
             }
@@ -384,6 +402,16 @@ impl<'a, 'r> FromRequest<'a, 'r> for AdminHeaders {
             }
         }
     }
+}
+
+impl Into<Headers> for AdminHeaders {    
+    fn into(self) -> Headers { 
+        Headers {
+            host: self.host,
+            device: self.device,
+            user: self.user
+        }
+     }
 }
 
 pub struct OwnerHeaders {

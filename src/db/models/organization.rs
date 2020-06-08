@@ -1,7 +1,8 @@
 use serde_json::Value;
 use std::cmp::Ordering;
+use num_traits::FromPrimitive;
 
-use super::{CollectionUser, User};
+use super::{CollectionUser, User, OrgPolicy};
 
 #[derive(Debug, Identifiable, Queryable, Insertable, AsChangeset)]
 #[table_name = "organizations"]
@@ -33,6 +34,7 @@ pub enum UserOrgStatus {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(num_derive::FromPrimitive)]
 pub enum UserOrgType {
     Owner = 0,
     Admin = 1,
@@ -135,16 +137,6 @@ impl UserOrgType {
             _ => None,
         }
     }
-
-    pub fn from_i32(i: i32) -> Option<Self> {
-        match i {
-            0 => Some(UserOrgType::Owner),
-            1 => Some(UserOrgType::Admin),
-            2 => Some(UserOrgType::User),
-            3 => Some(UserOrgType::Manager),
-            _ => None,
-        }
-    }
 }
 
 /// Local methods
@@ -170,11 +162,12 @@ impl Organization {
             "UseEvents": false,
             "UseGroups": false,
             "UseTotp": true,
+            "UsePolicies": true,
 
             "BusinessName": null,
-            "BusinessAddress1":	null,
-            "BusinessAddress2":	null,
-            "BusinessAddress3":	null,
+            "BusinessAddress1": null,
+            "BusinessAddress2": null,
+            "BusinessAddress3": null,
             "BusinessCountry": null,
             "BusinessTaxNumber": null,
 
@@ -205,7 +198,6 @@ impl UserOrganization {
 
 use crate::db::schema::{ciphers_collections, organizations, users_collections, users_organizations};
 use crate::db::DbConn;
-use diesel;
 use diesel::prelude::*;
 
 use crate::api::EmptyResult;
@@ -250,6 +242,7 @@ impl Organization {
         Cipher::delete_all_by_organization(&self.uuid, &conn)?;
         Collection::delete_all_by_organization(&self.uuid, &conn)?;
         UserOrganization::delete_all_by_organization(&self.uuid, &conn)?;
+        OrgPolicy::delete_all_by_organization(&self.uuid, &conn)?;
 
         diesel::delete(organizations::table.filter(organizations::uuid.eq(self.uuid)))
             .execute(&**conn)
@@ -262,12 +255,16 @@ impl Organization {
             .first::<Self>(&**conn)
             .ok()
     }
+
+    pub fn get_all(conn: &DbConn) -> Vec<Self> {
+        organizations::table.load::<Self>(&**conn).expect("Error loading organizations")
+    }
 }
 
 impl UserOrganization {
     pub fn to_json(&self, conn: &DbConn) -> Value {
         let org = Organization::find_by_uuid(&self.org_uuid, conn).unwrap();
-
+        
         json!({
             "Id": self.org_uuid,
             "Name": org.name,
@@ -280,6 +277,9 @@ impl UserOrganization {
             "UseEvents": false,
             "UseGroups": false,
             "UseTotp": true,
+            "UsePolicies": true,
+            "UseApi": false,
+            "SelfHost": true,
 
             "MaxStorageGb": 10, // The value doesn't matter, we don't check server-side
 
@@ -310,7 +310,7 @@ impl UserOrganization {
         })
     }
 
-    pub fn to_json_collection_user_details(&self, read_only: bool) -> Value {
+    pub fn to_json_read_only(&self, read_only: bool) -> Value {
         json!({
             "Id": self.uuid,
             "ReadOnly": read_only
@@ -435,6 +435,15 @@ impl UserOrganization {
             .filter(users_organizations::org_uuid.eq(org_uuid))
             .load::<Self>(&**conn)
             .expect("Error loading user organizations")
+    }
+
+    pub fn count_by_org(org_uuid: &str, conn: &DbConn) -> i64 {
+        users_organizations::table
+            .filter(users_organizations::org_uuid.eq(org_uuid))
+            .count()
+            .first::<i64>(&**conn)
+            .ok()
+            .unwrap_or(0)
     }
 
     pub fn find_by_org_and_type(org_uuid: &str, atype: i32, conn: &DbConn) -> Vec<Self> {
